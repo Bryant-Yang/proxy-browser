@@ -61,8 +61,14 @@ struct CheckPresentation {
 
     static func locations(_ evidence: DNSEvidence?, exitIP: String? = nil) -> String {
         guard let evidence else { return "" }
-        var lines = ["实际出口  \(NodeRegions.name(evidence.exit))"]
-        if let ip = exitIP ?? evidence.exitIP { lines[0] += "  ·  \(ip)" }
+        var exit = "实际出口  \(NodeRegions.name(evidence.exit))"
+        if let ip = exitIP ?? evidence.exitIP { exit += "  ·  \(ip)" }
+        return [exit, resolvers(evidence)].filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    static func resolvers(_ evidence: DNSEvidence?) -> String {
+        guard let evidence else { return "" }
+        var lines: [String] = []
         let groups = [("工具 DNS", evidence.tool), ("网页 DNS", evidence.page), ("下游 DNS", evidence.downstream)]
         for (label, group) in groups {
             guard let group else { continue }

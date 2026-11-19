@@ -10,7 +10,9 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     private let summary = NSTextField(labelWithString: "")
     private let detail = NSTextField(wrappingLabelWithString: "")
     private let progress = NSProgressIndicator()
-    private let checkDetails = CheckDetails()
+    private let details = RegionCheckDetails()
+    private let detailsButton = NSButton(title: "展开检测详情", target: nil, action: nil)
+    private let tableHeight: NSLayoutConstraint
     private let closeButton = NSButton(title: "停止检查", target: nil, action: nil)
     private let useButton = NSButton(title: "使用此节点", target: nil, action: nil)
     private var nodes: [String]
@@ -21,6 +23,8 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     private var stopping = false
 
     init(country: String, nodes: [String], action: @escaping (String?) -> Void) {
+        let scroll = NSScrollView()
+        tableHeight = scroll.heightAnchor.constraint(equalToConstant: 232)
         self.country = country
         self.nodes = nodes
         self.action = action
@@ -53,17 +57,26 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
             column.width = width
             table.addTableColumn(column)
         }
-        let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.borderType = .bezelBorder
-        scroll.heightAnchor.constraint(equalToConstant: 232).isActive = true
+        tableHeight.isActive = true
 
         detail.font = .systemFont(ofSize: 13)
         detail.textColor = BrowserPalette.muted
         detail.maximumNumberOfLines = 2
-        detail.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        detailsButton.target = self
+        detailsButton.action = #selector(toggleDetails)
+        detailsButton.bezelStyle = .rounded
+        detailsButton.imagePosition = .imageTrailing
+        detailsButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)
+        detailsButton.setContentHuggingPriority(.required, for: .horizontal)
+        let selection = NSStackView(views: [detail, NSView(), detailsButton])
+        selection.spacing = 12
+        selection.alignment = .centerY
+        selection.heightAnchor.constraint(equalToConstant: 36).isActive = true
         closeButton.target = self
         closeButton.action = #selector(closeOrStop)
         closeButton.bezelStyle = .rounded
@@ -73,11 +86,11 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         useButton.bezelStyle = .rounded
         useButton.keyEquivalent = "\r"
         useButton.isEnabled = false
-        let footer = NSStackView(views: [checkDetails.button, NSView(), closeButton, useButton])
+        let footer = NSStackView(views: [NSView(), closeButton, useButton])
         footer.spacing = 10
         footer.alignment = .centerY
         footer.heightAnchor.constraint(equalToConstant: 30).isActive = true
-        let content = NSStackView(views: [title, summary, progress, scroll, detail, footer])
+        let content = NSStackView(views: [title, summary, progress, scroll, selection, details.view, footer])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 10
@@ -171,17 +184,21 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     }
 
     private func refreshSelection() {
-        useButton.isEnabled = !scanning && selectedResult?.canUse == true
-        let webCount = results.values.filter { $0.websiteReachable == true }.count
-        let totals = results.isEmpty ? "" : "Google HTTPS  \(webCount)/\(results.count) 个已检查节点可达"
+        let selected = selectedResult
+        useButton.isEnabled = !scanning && selected?.canUse == true
+        detailsButton.isEnabled = !results.isEmpty || scanError != nil || !details.view.isHidden
+        let reachable = results.values.filter { $0.websiteReachable == true }.count
+        let batchReachability = results.isEmpty ? "" : "本批 Google \(reachable)/\(results.count) 可达"
 
-        guard let result = selectedResult else {
+        guard let result = selected else {
             if let scanError {
                 detail.stringValue = "请返回检查配置后重试。"
-                checkDetails.update(CheckPresentation.details(problem: scanError))
+                details.update(node: nil, batchReachability: batchReachability,
+                               record: CheckPresentation.details(problem: scanError))
             } else {
-                detail.stringValue = scanning ? "检查通过后可以选用节点。" : "检查通过的节点才会打开专用浏览器。"
-                checkDetails.update(totals)
+                detail.stringValue = scanning ? "检查通过后可以选用节点。" : "选中一个已检查的节点可查看结果。"
+                details.update(node: selectedName, batchReachability: batchReachability,
+                               record: selectedName == nil ? "选中一个已检查的节点可查看详情。" : "这个节点暂无检查结果。")
             }
             return
         }
@@ -191,17 +208,52 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         case false?: google = "未通过"
         case nil: google = "未测试"
         }
-        let diagnostic: String
+
+        let exit: String?
+        let evidence: DNSEvidence?
+        let dnsLocations: DNSLocations?
+        let reason: String
         switch result.result {
         case let .success(probe):
             detail.stringValue = "这条线路符合要求。连接时会再检查一次。"
-            diagnostic = CheckPresentation.locations(probe.evidence, exitIP: probe.exitIP)
+            exit = NodeRegions.name(probe.country) + " · " + probe.exitIP
+            evidence = probe.evidence
+            dnsLocations = probe.evidence.checkedPage
+            reason = ""
         case let .failure(problem):
             detail.stringValue = CheckPresentation(problem: problem, region: country).message
-            diagnostic = CheckPresentation.details(problem: problem)
+            evidence = problem.evidence
+            dnsLocations = problem.step == .toolDNS ? evidence?.tool : evidence?.checkedPage
+            let confirmed = problem.confirmedExit
+            exit = (confirmed?.country ?? evidence?.exit).map(NodeRegions.name).map { location in
+                (confirmed?.ip ?? evidence?.exitIP).map { location + " · " + $0 } ?? location
+            }
+            reason = problem.message == evidence?.summary ? problem.title : problem.message
         }
-        checkDetails.update([result.name, "Google HTTPS  " + google, diagnostic, totals]
-            .filter { !$0.isEmpty }.joined(separator: "\n\n"))
+        let diagnostic = [reason, CheckPresentation.resolvers(evidence)].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let dns = dnsLocations?.label ?? (evidence == nil ? nil : "未确认")
+        details.update(node: result.name, batchReachability: batchReachability, exit: exit, dns: dns, google: google,
+                       record: diagnostic.isEmpty ? "暂无更多检测记录。" : diagnostic)
+    }
+
+    @objc private func toggleDetails() {
+        let open = details.view.isHidden
+        details.view.isHidden = !open
+        detailsButton.title = open ? "收起检测详情" : "展开检测详情"
+        detailsButton.image = NSImage(systemSymbolName: open ? "chevron.up" : "chevron.down",
+                                      accessibilityDescription: nil)
+        let expandedHeight: CGFloat = 590
+        let collapsedHeight: CGFloat = 466
+        var height = open ? expandedHeight : collapsedHeight
+        if open, let screen = window.sheetParent?.screen ?? window.screen {
+            // A sheet expands below its attachment point. Keep the footer above the Dock.
+            let top = min(window.frame.maxY, screen.visibleFrame.maxY)
+            height = min(height, max(collapsedHeight, top - screen.visibleFrame.minY - 12))
+        }
+        tableHeight.constant = open ? 196 - (expandedHeight - height) : 232
+        window.setContentSize(NSSize(width: 620, height: height))
+        if table.selectedRow >= 0 { table.scrollRowToVisible(table.selectedRow) }
+        refreshSelection()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { nodes.count }
@@ -232,16 +284,10 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
                 }
             }
         }
-        let cell = NSTextField(labelWithString: value)
-        cell.font = .systemFont(ofSize: 13)
-        cell.textColor = color
-        cell.lineBreakMode = .byTruncatingTail
-        cell.toolTip = value
-        return cell
+        return RegionCheckCell(value: value, textColor: color)
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
-        checkDetails.close()
         refreshSelection()
     }
 
@@ -252,13 +298,42 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
             closeButton.isEnabled = false
             refreshSummary()
         }
-        checkDetails.close()
         action(nil)
     }
 
     @objc private func useSelected() {
         guard !scanning, let selection = selectedResult, selection.canUse else { return }
-        checkDetails.close()
         action(selection.name)
+    }
+}
+
+/// Keep status and node names legible when AppKit emphasizes the selected row.
+private final class RegionCheckCell: NSTableCellView {
+    private let normalColor: NSColor
+
+    init(value: String, textColor: NSColor) {
+        normalColor = textColor
+        super.init(frame: .zero)
+        let label = NSTextField(labelWithString: value)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = textColor
+        label.lineBreakMode = .byTruncatingTail
+        label.toolTip = value
+        addSubview(label)
+        textField = label
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet {
+            textField?.textColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : normalColor
+        }
     }
 }
