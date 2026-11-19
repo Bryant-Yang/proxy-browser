@@ -4,9 +4,13 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private static let windowSize = NSSize(width: 850, height: 536)
+    private static let sectionSpacing: CGFloat = 18
+
     private enum Screen {
         case idle
         case checking(ConnectionStep, String, DNSEvidence? = nil)
+        case awaitingDNSConfirmation(ConnectionProblem)
         case opening(ProbeResult, String, Date)
         case connected(ProbeResult, String)
         case stopping(String)
@@ -18,6 +22,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let regions = NSPopUpButton()
     private let nodes = NSPopUpButton()
     private let browsers = NSPopUpButton()
+    private let modes = NSPopUpButton()
+    private let subtitle = NSTextField(labelWithString: "")
     private let importButton = NSButton(title: "导入…", target: nil, action: nil)
     private let settingsButton = NSButton(title: "浏览器与内核", target: nil, action: nil)
     private let primary = ConnectButton(frame: .zero)
@@ -30,6 +36,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let progress = CheckProgress(frame: .zero)
     private let checks = [CheckRow("建立连接"), CheckRow("网页出口"), CheckRow("地址查询")]
     private let checkDetails = CheckDetails()
+    private var detailsHeight: NSLayoutConstraint!
     private let advanced = NSPopover()
     private let coreLabel = NSTextField(labelWithString: "")
     private var profiles: [ProfileChoice] = []
@@ -40,6 +47,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var preferences: [String: String] = [:]
     private var sourceError: String?
     private var screen = Screen.idle
+    private var mode: ConnectionMode { modes.indexOfSelectedItem == 1 ? .ordinary : .strict }
     private var engine: Engine?
     private var regionCheckEngine: Engine?
     private var regionCheckPanel: RegionCheckPanel?
@@ -129,7 +137,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 850, height: 536),
+        window = NSWindow(contentRect: NSRect(origin: .zero, size: Self.windowSize),
                           styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         window.title = "独立纯净代理"
@@ -144,11 +152,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mark = RouteMark()
         mark.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([mark.widthAnchor.constraint(equalToConstant: 52), mark.heightAnchor.constraint(equalToConstant: 52)])
+        subtitle.font = .systemFont(ofSize: 13)
+        subtitle.textColor = BrowserPalette.muted
         let header = stack([
             mark,
-            stack([text("独立纯净代理", 27, .semibold),
-                   text("网页出口与地址查询须在同一地区", 13, color: BrowserPalette.muted)],
-                  vertical: true, spacing: 4)
+            stack([text("独立纯净代理", 27, .semibold), subtitle], vertical: true, spacing: 4)
         ], spacing: 14)
         let connection = buildRouteCard()
         let status = buildStatusCard()
@@ -178,10 +186,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         regionCheckButton.controlSize = .large
         regionCheckButton.image = NSImage(systemSymbolName: "checklist", accessibilityDescription: nil)
         regionCheckButton.imagePosition = .imageLeading
-        let footer = stack([text("专用窗口 · 独立登录资料", 12, .medium, color: BrowserPalette.muted),
-                            NSView(), regionCheckButton, secondary, primary], spacing: 10)
+        let footer = stack([NSView(), regionCheckButton, secondary, primary], spacing: 10)
         footer.heightAnchor.constraint(equalToConstant: 42).isActive = true
-        let column = stack([header, body, footer], vertical: true, spacing: 18)
+        detailsHeight = checkDetails.view.heightAnchor.constraint(equalToConstant: 155)
+        // A hidden arranged view collapses in the stack, including its vertical spacing.
+        detailsHeight.priority = .defaultHigh
+        detailsHeight.isActive = true
+        checkDetails.onExpansionChange = { [weak self] in self?.resizeForDetails() }
+        let column = stack([header, body, checkDetails.view, footer], vertical: true, spacing: Self.sectionSpacing)
         canvas.addSubview(column)
         NSLayoutConstraint.activate([
             column.topAnchor.constraint(equalTo: canvas.topAnchor, constant: 42),
@@ -193,6 +205,24 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func resizeForDetails() {
+        let visible = window.screen?.visibleFrame
+        var contentSize = Self.windowSize
+        if checkDetails.isExpanded {
+            let available = visible.map { $0.height - contentSize.height - Self.sectionSpacing } ?? 155
+            detailsHeight.constant = min(155, max(112, available))
+            contentSize.height += detailsHeight.constant + Self.sectionSpacing
+        }
+        let height = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize)).height
+        var frame = window.frame
+        frame.origin.y = frame.maxY - height
+        frame.size.height = height
+        if let visible {
+            frame.origin.y = max(visible.minY, min(frame.origin.y, visible.maxY - height))
+        }
+        window.setFrame(frame, display: true)
     }
 
     private func buildRouteCard() -> NSView {
@@ -247,6 +277,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func buildStatusCard() -> NSView {
         let card = BrowserSurface(BrowserPalette.status, to: BrowserPalette.statusEdge, radius: 18, border: true)
         let eyebrow = text("连接检查", 12, .semibold, color: BrowserPalette.accent)
+        modes.addItems(withTitles: ["严格同区", "普通模式"])
+        modes.controlSize = .small
+        modes.setAccessibilityLabel("检查模式")
+        modes.toolTip = "切换检查模式"
+        modes.target = self
+        modes.action = #selector(modeChanged)
+        let heading = stack([eyebrow, NSView(), modes])
+        heading.heightAnchor.constraint(equalToConstant: 22).isActive = true
         title.font = .systemFont(ofSize: 22, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
         detail.font = .systemFont(ofSize: 13)
@@ -257,7 +295,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let rows = stack(checks, vertical: true, spacing: 4)
         let link = stack([checkDetails.button, NSView()])
         link.heightAnchor.constraint(equalToConstant: 23).isActive = true
-        let content = stack([eyebrow, title, detail, progress, rows, link], vertical: true, spacing: 8)
+        let content = stack([heading, title, detail, progress, rows, link], vertical: true, spacing: 8)
         content.setCustomSpacing(12, after: progress)
         content.setCustomSpacing(13, after: rows)
         place(content, in: card, inset: 22)
@@ -390,6 +428,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         render()
     }
 
+    @objc private func modeChanged() {
+        screen = .idle
+        render()
+    }
+
     @objc private func importProfile() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [UTType(filenameExtension: "yaml"), UTType(filenameExtension: "yml"), .json].compactMap { $0 }
@@ -488,6 +531,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         nodes.isEnabled = !busy && !route.available.isEmpty
         importButton.isEnabled = !busy
         settingsButton.isEnabled = !busy
+        modes.isEnabled = !busy
+        subtitle.stringValue = mode == .strict ? "网页出口与地址查询须在同一地区"
+            : "网页出口须符合所选地区，地址查询跨区时会提示"
         regionCheckButton.isHidden = false
         regionCheckButton.isEnabled = !busy && source != nil && coreURL != nil && !route.filter.isEmpty
             && !route.available.isEmpty && sourceError == nil
@@ -505,6 +551,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         checks.forEach { $0.show(.waiting) }
         title.textColor = BrowserPalette.ink
         var technical = ""
+        var evidence: DNSEvidence?
+        var confirmedExit: ExitLocation?
         var openPage: (() -> Void)?
 
         switch screen {
@@ -525,6 +573,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 detail.stringValue = browser == nil ? "先选择一个专用浏览器。" : "先选择一个代理内核。"
                 primary.title = "浏览器与内核"
                 primary.isEnabled = true
+            } else if mode == .ordinary && route.filter.isEmpty {
+                title.stringValue = "先选择一个地区"
+                detail.stringValue = "普通模式会核对网页出口是否在你选的地区。"
             } else if route.selected == nil {
                 title.stringValue = "选择一个节点"
                 detail.stringValue = route.filter.isEmpty ? "先选择你想使用的地区和节点。"
@@ -534,30 +585,44 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 detail.stringValue = "地区检查通过后，会打开专用浏览器。"
                 primary.isEnabled = true
             }
-        case let .checking(step, message, evidence):
+        case let .checking(step, message, progressEvidence):
             title.stringValue = "正在检查线路"
             let steps = ["正在建立连接。", "正在确认网页出口在哪个地区。", "正在检查网站地址从哪里查询。",
                          "正在核对网页连接使用的地址查询地区。", "正在打开专用浏览器。"]
             detail.stringValue = steps[step.rawValue]
-            technical = [message, CheckPresentation.locations(evidence)].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            technical = message
+            evidence = progressEvidence
             showChecks(step, evidence: evidence, state: .active)
             primary.title = "正在检查…"
             secondary.title = "取消"
             secondary.isHidden = false
+        case let .awaitingDNSConfirmation(problem):
+            title.stringValue = "地址查询地区不一致"
+            title.textColor = BrowserPalette.warning
+            detail.stringValue = CheckPresentation(problem: problem, region: route.filter).message
+            technical = technicalProblem(problem)
+            evidence = problem.evidence
+            showChecks(problem.step, evidence: problem.evidence, state: .failed)
+            primary.title = "仅本次继续"
+            primary.isEnabled = true
+            secondary.title = "取消"
+            secondary.isHidden = false
         case let .opening(result, interface, _):
-            title.stringValue = "已通过检查"
+            title.stringValue = result.dnsWarning == nil ? "已通过检查" : "已确认网页出口"
             detail.stringValue = "正在打开专用浏览器。"
-            technical = technicalResult(result, interface: interface)
-            showChecks(.browser, evidence: result.evidence, state: .passed)
+            technical = "独立网络接口  " + interface
+            evidence = result.evidence
+            showCompletedChecks(result)
             primary.title = "正在打开…"
             secondary.title = "取消"
             secondary.isHidden = false
         case let .connected(result, interface):
             title.stringValue = "已连接到" + NodeRegions.name(result.country)
-            detail.stringValue = "专用浏览器已打开。"
-            technical = technicalResult(result, interface: interface)
+            detail.stringValue = result.dnsWarning == nil ? "专用浏览器已打开。" : "已按本次确认继续，地址查询存在跨区。"
+            technical = "独立网络接口  " + interface
+            evidence = result.evidence
             openPage = { [weak self] in self?.openCheckPage() }
-            showChecks(.browser, evidence: result.evidence, state: .passed)
+            showCompletedChecks(result)
             primary.title = "断开连接"
             primary.isEnabled = true
         case let .stopping(message):
@@ -572,7 +637,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             detail.stringValue = isAddressMismatch
                 ? "地址查询和网页出口需要在同一地区，才能打开专用浏览器。"
                 : explanation.message
-            technical = CheckPresentation.details(problem: problem)
+            technical = technicalProblem(problem)
+            evidence = problem.evidence
+            confirmedExit = problem.confirmedExit
             showChecks(problem.step, evidence: problem.evidence, state: .failed)
             if let exit = problem.confirmedExit {
                 checks[1].show(.failed, value: NodeRegions.name(exit.country))
@@ -595,12 +662,21 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 secondary.isHidden = false
             }
         }
-        checkDetails.update(technical, openPage: openPage)
+        checkDetails.update(technical, evidence: evidence, confirmedExit: confirmedExit, openPage: openPage)
         primary.toolTip = primary.title
-        if primary.isEnabled, case .connected = screen {
-            primary.keyEquivalent = ""
-        } else if primary.isEnabled {
-            primary.keyEquivalent = "\r"
+        if primary.isEnabled {
+            switch screen {
+            case .connected, .awaitingDNSConfirmation: break
+            default: primary.keyEquivalent = "\r"
+            }
+        }
+    }
+
+    private func showCompletedChecks(_ result: ProbeResult) {
+        if let problem = result.dnsWarning {
+            showChecks(problem.step, evidence: result.evidence, state: .failed)
+        } else {
+            showChecks(.browser, evidence: result.evidence, state: .passed)
         }
     }
 
@@ -630,8 +706,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func technicalResult(_ result: ProbeResult, interface: String) -> String {
-        CheckPresentation.locations(result.evidence, exitIP: result.exitIP) + "\n\n独立网络接口  " + interface
+    private func technicalProblem(_ problem: ConnectionProblem) -> String {
+        let message = problem.message == problem.evidence?.summary ? "" : problem.message
+        return [problem.title, message].filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     private func openCheckPage() {
@@ -642,6 +719,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func primaryAction() {
         if case .connected = screen {
             stop("正在关闭专用窗口和独立代理。")
+            return
+        }
+        if case let .awaitingDNSConfirmation(problem) = screen {
+            screen = .checking(.exit, "继续前重新核对网页出口。", problem.evidence)
+            render()
+            engine?.confirmDNSWarning()
             return
         }
         guard engine == nil, regionCheckPanel == nil else { return }
@@ -659,9 +742,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         guard let source, sourceError == nil else { importProfile(); return }
         guard let browser, let core = coreURL else { showSettings(); return }
+        guard mode == .strict || !route.filter.isEmpty else { return }
         guard let node = route.selected, route.available.contains(node) else { return }
         let request = ConnectionRequest(source: source.url, node: node.name, core: core,
-                                        browser: browser.executable, country: route.filter)
+                                        browser: browser.executable, country: route.filter, mode: mode)
         advanced.close()
         checkDetails.close()
         saveSelection()
@@ -687,8 +771,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         advanced.close()
         checkDetails.close()
         let request = RegionCheckRequest(source: source.url, nodes: route.available.map(\.name),
-                                         core: coreURL, country: route.filter)
-        let panel = RegionCheckPanel(country: request.country, nodes: request.nodes) { [weak self] node in
+                                         core: coreURL, country: route.filter, mode: mode)
+        let panel = RegionCheckPanel(country: request.country, nodes: request.nodes, mode: request.mode) { [weak self] node in
             self?.finishRegionCheckAction(node)
         }
         regionCheckPanel = panel
@@ -751,6 +835,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         switch update {
         case let .checking(step, message, evidence):
             screen = .checking(step, message, evidence)
+        case let .awaitingDNSConfirmation(problem):
+            screen = .awaitingDNSConfirmation(problem)
         case let .opening(result, interface, pid):
             browserPID = pid
             screen = .opening(result, interface, Date())

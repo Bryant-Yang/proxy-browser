@@ -20,7 +20,7 @@ subprocess.run(['lipo','-create',str(arm),str(intel),'-output',str(app/'Contents
 subprocess.run(['strip','-S',str(app/'Contents/MacOS/ProxyBrowser')],check=True)
 info={'CFBundleName':'独立纯净代理','CFBundleDisplayName':'独立纯净代理',
       'CFBundleIdentifier':'net.bravewaves.proxy-browser','CFBundleExecutable':'ProxyBrowser',
-      'CFBundlePackageType':'APPL','CFBundleShortVersionString':'2.1.6','CFBundleVersion':'15',
+      'CFBundlePackageType':'APPL','CFBundleShortVersionString':'2.1.7','CFBundleVersion':'17',
       'LSMinimumSystemVersion':'13.0','NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication',
       'CFBundleIconFile':'AppIcon'}
 (app/'Contents/Info.plist').write_bytes(plistlib.dumps(info))

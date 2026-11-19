@@ -6,6 +6,8 @@ struct DNSLocations {
 
     var countries: [String] { records.map { $0["country"] ?? "" } }
 
+    var hasKnownCountries: Bool { !records.isEmpty && countries.allSatisfy { !$0.isEmpty } }
+
     var label: String {
         Set(countries.map { $0.isEmpty ? "未知" : NodeRegions.name($0) }).sorted().joined(separator: "、")
     }

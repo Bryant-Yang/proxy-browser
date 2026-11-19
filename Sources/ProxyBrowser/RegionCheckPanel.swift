@@ -5,6 +5,7 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 466),
                          styleMask: [.titled], backing: .buffered, defer: false)
     private let country: String
+    private let mode: ConnectionMode
     private let action: (String?) -> Void
     private let table = NSTableView()
     private let summary = NSTextField(labelWithString: "")
@@ -22,10 +23,11 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     private var scanning = true
     private var stopping = false
 
-    init(country: String, nodes: [String], action: @escaping (String?) -> Void) {
+    init(country: String, nodes: [String], mode: ConnectionMode, action: @escaping (String?) -> Void) {
         let scroll = NSScrollView()
         tableHeight = scroll.heightAnchor.constraint(equalToConstant: 232)
         self.country = country
+        self.mode = mode
         self.nodes = nodes
         self.action = action
         super.init()
@@ -144,10 +146,11 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         refreshSummary()
         let previous = selectedName
         let passed = nodes.filter { results[$0]?.canUse == true }
-        nodes = passed + nodes.filter { results[$0]?.canUse != true }
+        let needsConfirmation = nodes.filter { allowsConfirmation(results[$0]) }
+        nodes = passed + needsConfirmation + nodes.filter { results[$0]?.canUse != true && !allowsConfirmation(results[$0]) }
         table.reloadData()
         let selected = previous.flatMap { nodes.firstIndex(of: $0) }
-            ?? (passed.isEmpty ? nodes.firstIndex(where: { results[$0] != nil }) : 0)
+            ?? nodes.firstIndex { results[$0] != nil }
         if let selected {
             table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
             table.scrollRowToVisible(selected)
@@ -172,6 +175,10 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         } else {
             summary.stringValue = "已检查 \(results.count) 个节点，\(passed) 个符合要求"
         }
+        if !scanning && scanError == nil {
+            let count = results.values.filter { allowsConfirmation($0) }.count
+            if count > 0 { summary.stringValue += "，\(count) 个待确认" }
+        }
         summary.textColor = !scanning && passed > 0 ? BrowserPalette.accent : BrowserPalette.muted
     }
 
@@ -183,9 +190,16 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         selectedName.flatMap { results[$0] }
     }
 
+    private func allowsConfirmation(_ result: NodeCheck?) -> Bool {
+        guard case let .failure(problem)? = result?.result else { return false }
+        return mode.canConfirmDNSWarning(problem, country: country)
+    }
+
     private func refreshSelection() {
         let selected = selectedResult
-        useButton.isEnabled = !scanning && selected?.canUse == true
+        let needsConfirmation = allowsConfirmation(selected)
+        useButton.isEnabled = !scanning && (selected?.canUse == true || needsConfirmation)
+        useButton.title = needsConfirmation ? "选用并复查" : "使用此节点"
         detailsButton.isEnabled = !results.isEmpty || scanError != nil || !details.view.isHidden
         let reachable = results.values.filter { $0.websiteReachable == true }.count
         let batchReachability = results.isEmpty ? "" : "本批 Google \(reachable)/\(results.count) 可达"
@@ -221,7 +235,8 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
             dnsLocations = probe.evidence.checkedPage
             reason = ""
         case let .failure(problem):
-            detail.stringValue = CheckPresentation(problem: problem, region: country).message
+            detail.stringValue = needsConfirmation ? "网页出口符合要求，地址查询跨区。连接时会复查并请你确认。"
+                : CheckPresentation(problem: problem, region: country).message
             evidence = problem.evidence
             dnsLocations = problem.step == .toolDNS ? evidence?.tool : evidence?.checkedPage
             let confirmed = problem.confirmedExit
@@ -269,7 +284,8 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
             case .success?: (value, color) = ("符合要求", BrowserPalette.accent)
             case let .failure(problem)?:
                 let explanation = CheckPresentation(problem: problem, region: country)
-                (value, color) = (explanation.rowLabel, BrowserPalette.warning)
+                (value, color) = (allowsConfirmation(results[name]) ? "地址查询跨区 · 待确认" : explanation.rowLabel,
+                                  BrowserPalette.warning)
             case nil:
                 if let step = activeSteps[name] {
                     switch step {
@@ -302,7 +318,7 @@ final class RegionCheckPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     }
 
     @objc private func useSelected() {
-        guard !scanning, let selection = selectedResult, selection.canUse else { return }
+        guard !scanning, let selection = selectedResult, selection.canUse || allowsConfirmation(selection) else { return }
         action(selection.name)
     }
 }

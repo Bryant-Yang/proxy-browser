@@ -62,7 +62,7 @@ final class RegionCheckDetails {
         view.isHidden = true
     }
 
-    private static func metric(_ title: String, value: NSTextField) -> NSStackView {
+    static func metric(_ title: String, value: NSTextField) -> NSStackView {
         let caption = NSTextField(labelWithString: title)
         caption.font = .systemFont(ofSize: 11, weight: .medium)
         caption.textColor = BrowserPalette.muted

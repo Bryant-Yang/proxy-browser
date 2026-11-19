@@ -3,18 +3,35 @@ import CFNetwork
 import CryptoKit
 import Darwin
 
+enum ConnectionMode {
+    case strict, ordinary
+
+    func canConfirmDNSWarning(_ problem: ConnectionProblem, country: String) -> Bool {
+        guard self == .ordinary, let evidence = problem.evidence, evidence.exit == country,
+              ExitLocation(ip: evidence.exitIP, country: country) != nil,
+              evidence.tool?.hasKnownCountries == true, evidence.page?.hasKnownCountries == true else { return false }
+        switch problem.step {
+        case .toolDNS: return evidence.tool?.hasCrossRegion(country) == true
+        case .pageDNS: return evidence.checkedPage?.hasCrossRegion(country) == true
+        default: return false
+        }
+    }
+}
+
 struct ConnectionRequest {
     let source: URL
     let node: String
     let core: URL
     let browser: URL
     let country: String
+    let mode: ConnectionMode
 }
 struct ProbeResult {
     let exitIP: String
     let country: String
     let dns: [[String: String]]
     let evidence: DNSEvidence
+    var dnsWarning: ConnectionProblem? = nil
 }
 
 struct ExitLocation {
@@ -47,6 +64,7 @@ struct RegionCheckRequest {
     let nodes: [String]
     let core: URL
     let country: String
+    let mode: ConnectionMode
 }
 
 struct NodeCheck {
@@ -66,6 +84,7 @@ enum ConnectionStep: Int {
 
 enum ConnectionUpdate {
     case checking(ConnectionStep, String, DNSEvidence? = nil)
+    case awaitingDNSConfirmation(ConnectionProblem)
     case opening(ProbeResult, String, pid_t)
 }
 
@@ -94,6 +113,7 @@ final class Engine: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     private var reopen = false
+    private var dnsConfirmation: DispatchSemaphore?
     private var proxy: Process?
     private var browser: Process?
     private var resolvedProxy: ResolvedProxy?
@@ -112,7 +132,16 @@ final class Engine: @unchecked Sendable {
         self.parentStopped = parentStopped
     }
 
-    func stop() { lock.lock(); cancelled = true; lock.unlock() }
+    func stop() {
+        lock.withLock {
+            cancelled = true
+            dnsConfirmation?.signal()
+        }
+    }
+
+    func confirmDNSWarning() {
+        lock.withLock { _ = dnsConfirmation?.signal() }
+    }
     func openPage() { lock.lock(); reopen = true; lock.unlock() }
     private var stopped: Bool {
         lock.lock()
@@ -382,21 +411,24 @@ final class Engine: @unchecked Sendable {
         return try locate(addresses, via: relay, deadline: deadline)
     }
 
-    private func probe(_ relay: URLSession, corePort: Int, expected: String) throws -> ProbeResult {
+    private func probe(_ relay: URLSession, corePort: Int, expected: String, mode: ConnectionMode) throws -> ProbeResult {
         let exit = try readExit(relay, expected: expected)
         var evidence = DNSEvidence(exit: exit.country, exitIP: exit.ip)
         let core = session(port: corePort)
         defer { core.invalidateAndCancel() }
+        let tool: DNSLocations
         notify(.checking(.toolDNS, "正在确认加密 DNS 的解析器地区。", evidence))
         do {
-            evidence.tool = try measureToolDNS(core: core, relay: relay, evidence: evidence, deadline: .now() + 20)
+            tool = try measureToolDNS(core: core, relay: relay, evidence: evidence, deadline: .now() + 20)
+            evidence.tool = tool
         } catch {
             throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 待确认",
                                     message: "加密 DNS 的有效样本不足。请重试。",
                                     recovery: .retry, evidence: evidence)
         }
-        guard let tool = evidence.tool, tool.matches(exit.country) else {
-            let crossesRegion = evidence.tool?.hasCrossRegion(exit.country) == true
+        let toolMatches = tool.matches(exit.country)
+        guard toolMatches || (mode == .ordinary && tool.hasKnownCountries) else {
+            let crossesRegion = tool.hasCrossRegion(exit.country)
             throw ConnectionProblem(step: .toolDNS, title: crossesRegion ? "工具 DNS 跨区" : "工具 DNS 待确认",
                                     message: evidence.summary, recovery: crossesRegion ? .selectNode : .retry,
                                     evidence: evidence)
@@ -422,7 +454,32 @@ final class Engine: @unchecked Sendable {
                                     message: evidence.summary,
                                     recovery: downstreamMismatch || pageMismatch ? .selectNode : .retry, evidence: evidence)
         }
+        if !toolMatches {
+            throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 跨区", message: evidence.summary,
+                                    recovery: .selectNode, evidence: evidence)
+        }
         return ProbeResult(exitIP: exit.ip, country: exit.country, dns: page.records, evidence: evidence)
+    }
+
+    private func confirmAndRecheck(_ problem: ConnectionProblem, relay: URLSession,
+                                   country: String) throws -> ProbeResult {
+        guard var evidence = problem.evidence else { throw problem }
+        let confirmation = DispatchSemaphore(value: 0)
+        lock.withLock { dnsConfirmation = confirmation }
+        defer { lock.withLock { dnsConfirmation = nil } }
+        guard !stopped else { throw problem }
+        writeState(["status": "awaiting_dns_confirmation"])
+        notify(.awaitingDNSConfirmation(problem))
+        while confirmation.wait(timeout: .now() + .milliseconds(250)) == .timedOut {
+            guard !stopped else { throw problem }
+            guard proxy?.isRunning == true else { throw AppFailure("独立内核已退出。请重新连接。") }
+        }
+        guard !stopped else { throw problem }
+        let exit = try readExit(relay, expected: country)
+        // DNS evidence describes the same relay; an exit IP can rotate within the verified country.
+        evidence.exitIP = exit.ip
+        return ProbeResult(exitIP: exit.ip, country: exit.country, dns: evidence.page?.records ?? [],
+                           evidence: evidence, dnsWarning: problem)
     }
 
     func start(_ request: ConnectionRequest) {
@@ -489,7 +546,7 @@ final class Engine: @unchecked Sendable {
             defer { session.invalidateAndCancel() }
             websiteReachable = (try? fetchData(session, "https://www.gstatic.com/generate_204",
                                                deadline: .now() + 7, expectedStatus: 204)) != nil
-            let probe = try probe(session, corePort: ports.mihomo, expected: request.country)
+            let probe = try probe(session, corePort: ports.mihomo, expected: request.country, mode: request.mode)
             guard let proxy, proxy.isRunning,
                   Self.ownsLoopbackListener(pid: proxy.processIdentifier, port: ports.mihomo) else {
                 throw AppFailure("独立内核监听已结束，请重新检查。")
@@ -615,7 +672,11 @@ final class Engine: @unchecked Sendable {
             let checks: ProbeResult
             do {
                 defer { checkingSession.invalidateAndCancel() }
-                checks = try probe(checkingSession, corePort: ports.mihomo, expected: request.country)
+                do {
+                    checks = try probe(checkingSession, corePort: ports.mihomo, expected: request.country, mode: request.mode)
+                } catch let problem as ConnectionProblem where request.mode.canConfirmDNSWarning(problem, country: request.country) {
+                    checks = try confirmAndRecheck(problem, relay: checkingSession, country: request.country)
+                }
             }
             if stopped { return }
             guard let proxy, proxy.isRunning,
@@ -650,6 +711,7 @@ final class Engine: @unchecked Sendable {
                         "profile": profile.path, "exit_ip": checks.exitIP,
                         "exit_country": checks.country, "dns": checks.dns,
                         "tool_dns": checks.evidence.tool?.records ?? [],
+                        "dns_warning_accepted": checks.dnsWarning != nil,
                         "browser_executable": request.browser.path])
             notify(.opening(checks, interface, browser!.processIdentifier))
             while !stopped {
