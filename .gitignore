@@ -1,0 +1,15 @@
+.DS_Store
+.build/
+.build-*/
+.swiftpm/
+AppIcon.iconset/
+dist/
+*.app/
+*.log
+*.zip
+.env
+.env.*
+Browser Profiles/
+Runs/
+settings.json
+current-run.json
