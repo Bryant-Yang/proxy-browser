@@ -13,6 +13,7 @@ final class ResolvedProxy: @unchecked Sendable {
         let request: Data
     }
     private let upstreamPort: Int
+    private let probeTargets: [String: String]
     private let queue = DispatchQueue(label: "proxy-browser.resolved-proxy")
     private let session: URLSession
     private var listener: NWListener?
@@ -20,8 +21,9 @@ final class ResolvedProxy: @unchecked Sendable {
     private var cache: [String: (String, Date)] = [:]
     private var closed = false
 
-    init(upstreamPort: Int) {
+    init(upstreamPort: Int, probeTargets: [String: String] = [:]) {
         self.upstreamPort = upstreamPort
+        self.probeTargets = probeTargets
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 12
@@ -107,13 +109,19 @@ final class ResolvedProxy: @unchecked Sendable {
         }
     }
 
+    static func dnsQuery(_ host: String, type: String) -> URLRequest {
+        var url = URLComponents(string: "https://8.8.8.8/resolve")!
+        url.queryItems = [URLQueryItem(name: "name", value: host), URLQueryItem(name: "type", value: type)]
+        var request = URLRequest(url: url.url!)
+        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+        return request
+    }
+
     private func resolve(_ host: String, then: @escaping (String?) -> Void) {
+        if let pinned = probeTargets[host] { then(pinned); return }
         if Self.ipv4(host) { then(host); return }
         if let (ip, expiry) = cache[host], expiry > Date() { then(ip); return }
-        var url = URLComponents(string: "https://8.8.8.8/resolve")!
-        url.queryItems = [URLQueryItem(name: "name", value: host), URLQueryItem(name: "type", value: "A")]
-        var request = URLRequest(url: url.url!); request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-        session.dataTask(with: request) { [weak self] data, response, _ in
+        session.dataTask(with: Self.dnsQuery(host, type: "A")) { [weak self] data, response, _ in
             self?.queue.async {
                 guard let self = self, !self.closed else { then(nil); return }
                 guard (response as? HTTPURLResponse)?.statusCode == 200, let data = data,

@@ -107,6 +107,8 @@ final class CheckRow: NSStackView {
         label.font = .systemFont(ofSize: 12, weight: .medium)
         caption.font = .systemFont(ofSize: 11, weight: .medium)
         caption.setContentHuggingPriority(.required, for: .horizontal)
+        caption.lineBreakMode = .byTruncatingTail
+        caption.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         mark.widthAnchor.constraint(equalToConstant: 16).isActive = true
         mark.heightAnchor.constraint(equalToConstant: 16).isActive = true
         mark.imageScaling = .scaleProportionallyDown
@@ -117,7 +119,7 @@ final class CheckRow: NSStackView {
 
     @available(*, unavailable) required init(coder: NSCoder) { fatalError() }
 
-    func show(_ state: State) {
+    func show(_ state: State, value: String? = nil) {
         let symbol: String
         let wording: String
         let tint: NSColor
@@ -131,8 +133,8 @@ final class CheckRow: NSStackView {
         mark.contentTintColor = tint
         label.textColor = BrowserPalette.ink
         caption.textColor = tint
-        caption.stringValue = wording
-        setAccessibilityLabel(name + " " + wording)
+        caption.stringValue = value ?? wording
+        setAccessibilityLabel(name + " " + (value ?? wording))
     }
 }
 
@@ -190,6 +192,7 @@ final class ConnectButton: NSButton {
 }
 
 final class CheckProgress: NSView {
+    private let stages = 3
     var completed = 0 {
         didSet {
             setAccessibilityValue(completed)
@@ -203,7 +206,7 @@ final class CheckProgress: NSView {
         setAccessibilityRole(.progressIndicator)
         setAccessibilityLabel("连接检查进度")
         setAccessibilityMinValue(0)
-        setAccessibilityMaxValue(3)
+        setAccessibilityMaxValue(stages)
     }
 
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
@@ -215,8 +218,8 @@ final class CheckProgress: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let gap: CGFloat = 5
-        let width = (bounds.width - gap * 2) / 3
-        for index in 0..<3 {
+        let width = (bounds.width - gap * CGFloat(stages - 1)) / CGFloat(stages)
+        for index in 0..<stages {
             (index < completed ? BrowserPalette.accent : BrowserPalette.edge).setFill()
             let bar = NSRect(x: CGFloat(index) * (width + gap), y: (bounds.height - 3) / 2,
                              width: width, height: 3)

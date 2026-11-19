@@ -25,7 +25,7 @@ final class ResolvedProxyTests: XCTestCase {
             XCTAssertThrowsError(try ResolvedProxy.target(Data(header.utf8)))
         }
     }
-    func testRelayTunnelsOnlyNumericDestinationAndStopsListener() throws {
+    func testDiagnosticHostTunnelsItsPinnedAddressAndStopsListener() throws {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         let upstream = try NWListener(using: parameters)
@@ -50,7 +50,7 @@ final class ResolvedProxyTests: XCTestCase {
             }
         }
         upstream.start(queue: queue); wait(for: [ready], timeout: 3)
-        let relay = ResolvedProxy(upstreamPort: Int(upstream.port!.rawValue))
+        let relay = ResolvedProxy(upstreamPort: Int(upstream.port!.rawValue), probeTargets: ["original.example": "203.0.113.7"])
         let port = try relay.start()
         defer { relay.stop(); upstream.cancel(); retained?.cancel() }
         let fd = socket(AF_INET, SOCK_STREAM, 0); XCTAssertGreaterThanOrEqual(fd, 0)
@@ -61,7 +61,7 @@ final class ResolvedProxyTests: XCTestCase {
         address.sin_family = sa_family_t(AF_INET); address.sin_port = UInt16(port).bigEndian; address.sin_addr.s_addr = inet_addr("127.0.0.1")
         let result = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         XCTAssertEqual(result, 0)
-        let header = Data("CONNECT 203.0.113.7:443 HTTP/1.1\r\nHost: original.example\r\n\r\n".utf8)
+        let header = Data("CONNECT original.example:443 HTTP/1.1\r\nHost: original.example\r\n\r\n".utf8)
         _ = header.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, header.count) }
         var buffer = [UInt8](repeating: 0, count: 4096)
         let count = Darwin.read(fd, &buffer, buffer.count)
