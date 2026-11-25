@@ -35,4 +35,33 @@ final class RouteSelectionTests: XCTestCase {
         XCTAssertEqual(NodeRegions.infer("🇭🇰 中国香港特别行政区"), "HK")
         XCTAssertEqual(NodeRegions.infer("Great Britain | 01"), "GB")
     }
+
+    func testUnambiguousTextControlsFilteringWhenFlagsDiffer() {
+        let american = "\u{1F1FA}\u{1F1F2} 美国 02"
+        let taiwanese = "\u{1F1E8}\u{1F1F3} 台湾 TEST"
+        let german = "\u{1F1EF}\u{1F1F5} Germany TEST"
+        var selection = RouteSelection(names: [american, taiwanese, german], savedNode: american)
+
+        XCTAssertEqual(Set(selection.regions), ["US", "TW", "DE"])
+        selection.setFilter("US")
+        XCTAssertEqual(selection.available.map(\.name), [american])
+        XCTAssertEqual(selection.selected?.name, american)
+    }
+
+    func testFlagOnlySuppliesRegionWhenTextHasNoRegion() {
+        let japan = "\u{1F1EF}\u{1F1F5}"
+        let america = "\u{1F1FA}\u{1F1F8}"
+        XCTAssertEqual(NodeRegions.infer(japan + " 01"), "JP")
+        XCTAssertNil(NodeRegions.infer(japan + " " + america + " 01"))
+        XCTAssertNil(NodeRegions.infer(japan + " 美国入口 → 新加坡"))
+        XCTAssertNil(NodeRegions.infer("JP | " + america + " United States 01"))
+    }
+
+    func testRegionCodeAfterDecorativeFlagTakesPrecedence() {
+        let decoratedTaiwan = "\u{1F1E8}\u{1F1F3} TW-TEST"
+        let decoratedAmerica = "\u{1F1FA}\u{1F1F2} | US TEST"
+        XCTAssertEqual(NodeRegions.infer(decoratedTaiwan), "TW")
+        XCTAssertEqual(NodeRegions.infer(decoratedAmerica), "US")
+        XCTAssertNil(NodeRegions.infer(decoratedTaiwan + " United States"))
+    }
 }

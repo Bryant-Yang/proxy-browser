@@ -2,14 +2,17 @@ import Foundation
 import CFNetwork
 import CryptoKit
 import Darwin
+import os
 
 enum ConnectionMode {
     case strict, ordinary
 
     func canConfirmDNSWarning(_ problem: ConnectionProblem, country: String) -> Bool {
-        guard self == .ordinary, let evidence = problem.evidence, evidence.exit == country,
+        guard self == .ordinary, problem.recovery == .selectNode,
+              let evidence = problem.evidence, evidence.exit == country,
               ExitLocation(ip: evidence.exitIP, country: country) != nil,
-              evidence.tool?.hasKnownCountries == true, evidence.page?.hasKnownCountries == true else { return false }
+              evidence.tool?.hasKnownCountries == true, evidence.page?.hasKnownCountries == true,
+              evidence.downstream?.hasKnownCountries ?? true else { return false }
         switch problem.step {
         case .toolDNS: return evidence.tool?.hasCrossRegion(country) == true
         case .pageDNS: return evidence.checkedPage?.hasCrossRegion(country) == true
@@ -34,6 +37,15 @@ struct ProbeResult {
     var dnsWarning: ConnectionProblem? = nil
 }
 
+struct IncompleteDNSSamples: Error {
+    let addresses: Set<String>
+}
+
+private struct DNSMeasurement {
+    let locations: DNSLocations?
+    let hasEnoughSamples: Bool
+}
+
 struct ExitLocation {
     let ip: String
     let country: String
@@ -43,6 +55,11 @@ struct ExitLocation {
               Locale.Region.isoRegions.contains(Locale.Region(country)) else { return nil }
         self.ip = ip
         self.country = country
+    }
+
+    static func ipLeak(_ body: Data) -> ExitLocation? {
+        guard let response = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        return ExitLocation(ip: response["ip"] as? String, country: response["country_code"] as? String)
     }
 
     static func cloudflare(_ body: Data) -> ExitLocation? {
@@ -106,6 +123,11 @@ struct ConnectionProblem: LocalizedError {
         self.recovery = recovery
         self.evidence = evidence
         self.confirmedExit = confirmedExit
+    }
+
+    func retainingCrossRegion(from observations: DNSEvidence?) -> ConnectionProblem {
+        ConnectionProblem(step: step, title: title, message: message, recovery: recovery,
+                          evidence: evidence?.retainingCrossRegion(from: observations), confirmedExit: confirmedExit)
     }
 }
 
@@ -213,7 +235,7 @@ final class Engine: @unchecked Sendable {
         child.waitUntilExit()
     }
 
-    private func session(port: Int) -> URLSession {
+    private func sessionConfiguration(port: Int) -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
         configuration.timeoutIntervalForResource = 12
@@ -228,7 +250,11 @@ final class Engine: @unchecked Sendable {
             kCFNetworkProxiesHTTPSProxy as String: "127.0.0.1",
             kCFNetworkProxiesHTTPSPort as String: port
         ]
-        return URLSession(configuration: configuration)
+        return configuration
+    }
+
+    private func session(port: Int) -> URLSession {
+        URLSession(configuration: sessionConfiguration(port: port))
     }
 
     private func fetchData(_ session: URLSession, _ url: String, deadline: DispatchTime,
@@ -238,29 +264,50 @@ final class Engine: @unchecked Sendable {
 
     private func fetchData(_ session: URLSession, _ request: URLRequest, deadline: DispatchTime,
                            expectedStatus: Int = 200) throws -> Data {
+        try fetchResponses(session, [request], deadline: deadline, expectedStatus: expectedStatus)[0].get()
+    }
+
+    private func fetchResponses(_ session: URLSession, _ requests: [URLRequest], deadline: DispatchTime,
+                                expectedStatus: Int = 200,
+                                keepCompletedOnStop: Bool = false) throws -> [Result<Data, AppFailure>] {
+        try fetchResponses(requests.map { (session, $0) }, deadline: deadline, expectedStatus: expectedStatus,
+                           keepCompletedOnStop: keepCompletedOnStop)
+    }
+
+    private func fetchResponses(_ requests: [(session: URLSession, request: URLRequest)], deadline: DispatchTime,
+                                expectedStatus: Int = 200,
+                                keepCompletedOnStop: Bool = false) throws -> [Result<Data, AppFailure>] {
         if stopped { throw AppFailure("启动已取消。") }
         let now = DispatchTime.now()
         guard now < deadline else { throw AppFailure("检测服务响应超时。") }
         let limit = min(deadline, now + 14)
-        let gate = DispatchSemaphore(value: 0)
-        var received: Data?
-        var status = 0
-        let task = session.dataTask(with: request) { data, response, _ in
-            received = data
-            status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            gate.signal()
+        let pending = DispatchGroup()
+        let results = OSAllocatedUnfairLock(initialState: Array<Result<Data, AppFailure>>(
+            repeating: .failure(AppFailure("检测服务响应超时。")), count: requests.count))
+        let tasks = requests.enumerated().map { index, entry in
+            pending.enter()
+            let task = entry.session.dataTask(with: entry.request) { data, response, _ in
+                defer { pending.leave() }
+                guard DispatchTime.now() < limit else { return }
+                let result: Result<Data, AppFailure>
+                if (response as? HTTPURLResponse)?.statusCode == expectedStatus, let data, data.count <= 262144 {
+                    result = .success(data)
+                } else {
+                    result = .failure(AppFailure("检查服务暂不可用，或所选节点连接失败。"))
+                }
+                results.withLock { $0[index] = result }
+            }
+            task.resume()
+            return task
         }
-        task.resume()
-        while gate.wait(timeout: min(limit, .now() + .milliseconds(100))) != .success {
+        while pending.wait(timeout: min(limit, .now() + .milliseconds(100))) != .success {
             if stopped || DispatchTime.now() >= limit {
-                task.cancel()
-                throw AppFailure(stopped ? "连接已取消。" : "检测服务响应超时。")
+                for task in tasks { task.cancel() }
+                break
             }
         }
-        guard status == expectedStatus, let received, received.count <= 262144 else {
-            throw AppFailure("检查服务暂不可用，或所选节点连接失败。")
-        }
-        return received
+        guard keepCompletedOnStop || !stopped else { throw AppFailure("连接已取消。") }
+        return results.withLock { $0 }
     }
 
     private func fetch(_ session: URLSession, _ url: String, deadline: DispatchTime) throws -> [String: Any] {
@@ -272,32 +319,39 @@ final class Engine: @unchecked Sendable {
     }
 
     static func collectDNSResolvers(sample: (Int) throws -> [String: Any],
-                                    retrying: (Int, Int) -> Void) throws -> Set<String> {
+                                    retrying: (Int, Int, Int) -> Void) throws -> Set<String> {
         let requiredSamples = 3
         let retryLimit = 3
         var successfulSamples = 0
         var emptySamples = 0
+        var consecutiveEmpty = 0
         var resolvers = Set<String>()
 
         // Each attempt gets a fresh DNS hostname. An empty reply cannot count as a sample.
         for attempt in 1...(requiredSamples + retryLimit) {
-            let reply = try sample(attempt)
+            let reply: [String: Any]
+            do { reply = try sample(attempt) }
+            catch { throw IncompleteDNSSamples(addresses: resolvers) }
             if let found = reply["ip"] as? [String: Any], !found.isEmpty {
-                resolvers.formUnion(found.keys)
+                let valid = found.keys.filter(DNSLocations.isAddress)
+                resolvers.formUnion(valid)
+                guard valid.count == found.count else { throw IncompleteDNSSamples(addresses: resolvers) }
                 successfulSamples += 1
+                consecutiveEmpty = 0
                 if successfulSamples == requiredSamples { return resolvers }
                 continue
             }
             let emptyDictionary = (reply["ip"] as? [String: Any])?.isEmpty == true
             let emptyArray = (reply["ip"] as? [Any])?.isEmpty == true
             guard emptyDictionary || emptyArray else {
-                throw AppFailure("DNS 检测返回了无法识别的样本。")
+                throw IncompleteDNSSamples(addresses: resolvers)
             }
             emptySamples += 1
             guard emptySamples <= retryLimit else { break }
-            retrying(emptySamples, retryLimit)
+            consecutiveEmpty += 1
+            retrying(emptySamples, retryLimit, consecutiveEmpty)
         }
-        throw AppFailure("DNS 补测后仍未取得足够的解析器样本。")
+        throw IncompleteDNSSamples(addresses: resolvers)
     }
 
     static func reviewExit(_ primary: ExitLocation, expected: String, secondary: () -> ExitLocation?) throws {
@@ -325,21 +379,22 @@ final class Engine: @unchecked Sendable {
         }
     }
 
-    private func readExit(_ session: URLSession, expected: String) throws -> ExitLocation {
+    func readExit(_ session: URLSession, expected: String) throws -> ExitLocation {
+        let requests = [
+            URLRequest(url: URL(string: "https://ipv4.ipleak.net/json/")!),
+            URLRequest(url: URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!)
+        ]
         let deadline = DispatchTime.now() + 24
         notify(.checking(.exit, "正在用两个服务确认实际出口。"))
         var openProblem: ConnectionProblem?
         for attempt in 1...2 {
             guard !stopped, DispatchTime.now() < deadline else { break }
-            let limit = min(deadline, .now() + 6)
-            if let response = try? fetch(session, "https://ipv4.ipleak.net/json/", deadline: limit),
-               let address = ExitLocation(ip: response["ip"] as? String, country: response["country_code"] as? String) {
+            let limit = min(deadline, .now() + 12)
+            if let responses = try? fetchResponses(session, requests, deadline: limit),
+               let address = (try? responses[0].get()).flatMap(ExitLocation.ipLeak) {
+                let review = (try? responses[1].get()).flatMap(ExitLocation.cloudflare)
                 do {
-                    try Self.reviewExit(address, expected: expected) {
-                        guard let trace = try? fetchData(session, "https://www.cloudflare.com/cdn-cgi/trace",
-                                                         deadline: min(deadline, .now() + 6)) else { return nil }
-                        return ExitLocation.cloudflare(trace)
-                    }
+                    try Self.reviewExit(address, expected: expected) { review }
                     return address
                 } catch let problem as ConnectionProblem {
                     openProblem = problem
@@ -351,42 +406,71 @@ final class Engine: @unchecked Sendable {
             }
         }
         throw openProblem ?? ConnectionProblem(step: .exit, title: "未取得出口信息",
-                                               message: "节点或出口检测服务响应异常。请重试。", recovery: .retry)
+                                               message: "IPLeak 暂无有效结果，无法完成双源出口复核。请重试。", recovery: .retry)
     }
 
-    private func locate(_ addresses: Set<String>, via session: URLSession,
-                        deadline: DispatchTime) throws -> DNSLocations {
-        let records = try addresses.sorted().map { address in
-            guard DNSLocations.isAddress(address) else { throw AppFailure("DNS 样本地址无效。") }
-            let location = try fetch(session, "https://ipleak.net/json/" + address, deadline: deadline)
-            let country = location["country_code"] as? String ?? ""
+    func locate(_ addresses: Set<String>, via session: URLSession, deadline: DispatchTime) throws -> DNSLocations {
+        guard addresses.allSatisfy(DNSLocations.isAddress), addresses.count <= 48 else {
+            throw AppFailure("DNS 样本地址无效。")
+        }
+        let ordered = addresses.sorted()
+        let requests = ordered.map { URLRequest(url: URL(string: "https://ipleak.net/json/" + $0)!) }
+        let replies = try fetchResponses(session, requests, deadline: deadline)
+        let records = zip(ordered, replies).map { address, reply in
+            let data = try? reply.get()
+            let info = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let country = info?["country_code"] as? String ?? ""
             return ["ip": address, "country": Locale.Region.isoRegions.contains(Locale.Region(country)) ? country : ""]
         }
         return DNSLocations(records: records)
     }
 
-    private func measureToolDNS(core: URLSession, relay: URLSession, evidence: DNSEvidence, deadline: DispatchTime) throws -> DNSLocations {
-        let addresses = try Self.collectDNSResolvers { _ in
-            let name = String(UUID().uuidString.lowercased().prefix(8)) + ".test.dnscheck.tools"
-            guard let data = try? fetchData(core, ResolvedProxy.dnsQuery(name, type: "TXT"), deadline: deadline),
-                  let address = DNSLocations.resolverAddress(data) else { return ["ip": []] }
-            return ["ip": [address: 1]]
-        } retrying: { retry, limit in
-            notify(.checking(.toolDNS, "正在补测工具 DNS 样本（\(retry)/\(limit)）。", evidence))
+    private func measureToolDNS(core: URLSession, relay: URLSession, evidence: DNSEvidence, deadline: DispatchTime,
+                                startBackup: (ConnectionStep, DNSEvidence) -> Void) throws -> DNSMeasurement {
+        try locateSamples(via: relay, deadline: deadline, onIncomplete: { startBackup(.toolDNS, evidence) }) {
+            try Self.collectDNSResolvers { _ in
+                let name = String(UUID().uuidString.lowercased().prefix(8)) + ".test.dnscheck.tools"
+                guard let data = try? fetchData(core, ResolvedProxy.dnsQuery(name, type: "TXT"), deadline: deadline),
+                      let address = DNSLocations.resolverAddress(data) else { return ["ip": []] }
+                return ["ip": [address: 1]]
+            } retrying: { retry, limit, consecutiveEmpty in
+                notify(.checking(.toolDNS, "正在补测工具 DNS 样本（\(retry)/\(limit)）。", evidence))
+                if consecutiveEmpty == 2 { startBackup(.toolDNS, evidence) }
+            }
         }
-        return try locate(addresses, via: relay, deadline: deadline)
     }
 
     private func measurePageDNS(_ session: URLSession, evidence: DNSEvidence,
-                                deadline: DispatchTime) throws -> DNSLocations {
+                                deadline: DispatchTime,
+                                startBackup: (ConnectionStep, DNSEvidence) -> Void) throws -> DNSMeasurement {
         let token = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "") + "prbcheck"
-        let addresses = try Self.collectDNSResolvers { attempt in
-            (try? fetch(session, "https://\(token)-\(attempt).ipleak.net/dnsdetection/", deadline: deadline)) ?? ["ip": []]
-        } retrying: { retry, limit in
-            notify(.checking(.pageDNS, "正在补测网页 DNS 样本（\(retry)/\(limit)）。", evidence))
-            Thread.sleep(forTimeInterval: 0.4)
+        return try locateSamples(via: session, deadline: deadline, onIncomplete: { startBackup(.pageDNS, evidence) }) {
+            try Self.collectDNSResolvers { attempt in
+                (try? fetch(session, "https://\(token)-\(attempt).ipleak.net/dnsdetection/", deadline: deadline)) ?? ["ip": []]
+            } retrying: { retry, limit, consecutiveEmpty in
+                notify(.checking(.pageDNS, "正在补测网页 DNS 样本（\(retry)/\(limit)）。", evidence))
+                if consecutiveEmpty == 2 { startBackup(.pageDNS, evidence) }
+                Thread.sleep(forTimeInterval: 0.4)
+            }
         }
-        return try locate(addresses, via: session, deadline: deadline)
+    }
+
+    private func locateSamples(via session: URLSession, deadline: DispatchTime, onIncomplete: () -> Void,
+                               collect: () throws -> Set<String>) throws -> DNSMeasurement {
+        let addresses: Set<String>
+        let complete: Bool
+        do {
+            addresses = try collect()
+            complete = true
+        } catch let incomplete as IncompleteDNSSamples {
+            addresses = incomplete.addresses
+            complete = false
+        }
+        guard !addresses.isEmpty else { return DNSMeasurement(locations: nil, hasEnoughSamples: false) }
+        if !complete || DispatchTime.now() >= deadline { onIncomplete() }
+        let limit = complete && DispatchTime.now() < deadline ? deadline : .now() + 6
+        return try DNSMeasurement(locations: locate(addresses, via: session, deadline: limit),
+                                  hasEnoughSamples: complete)
     }
 
     private func reviewDownstream(corePort: Int, core: URLSession, relay: URLSession,
@@ -413,52 +497,240 @@ final class Engine: @unchecked Sendable {
 
     private func probe(_ relay: URLSession, corePort: Int, expected: String, mode: ConnectionMode) throws -> ProbeResult {
         let exit = try readExit(relay, expected: expected)
-        var evidence = DNSEvidence(exit: exit.country, exitIP: exit.ip)
         let core = session(port: corePort)
         defer { core.invalidateAndCancel() }
-        let tool: DNSLocations
-        notify(.checking(.toolDNS, "正在确认加密 DNS 的解析器地区。", evidence))
-        do {
-            tool = try measureToolDNS(core: core, relay: relay, evidence: evidence, deadline: .now() + 20)
-            evidence.tool = tool
-        } catch {
-            throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 待确认",
-                                    message: "加密 DNS 的有效样本不足。请重试。",
-                                    recovery: .retry, evidence: evidence)
+        let configuration = relay.configuration
+        return try probeDNS(exit: exit) { startBackup in
+            try probeUsingIPLeak(relay, core: core, corePort: corePort, exit: exit, mode: mode,
+                                 startBackup: startBackup)
+        } backup: { worker, initial, observed in
+            let core = worker.session(port: corePort)
+            defer { core.invalidateAndCancel() }
+            return try worker.probeUsingDNSCheck(configuration, core: core, corePort: corePort, exit: exit,
+                                                 mode: mode, initial: initial, observed: observed)
         }
-        let toolMatches = tool.matches(exit.country)
-        guard toolMatches || (mode == .ordinary && tool.hasKnownCountries) else {
-            let crossesRegion = tool.hasCrossRegion(exit.country)
-            throw ConnectionProblem(step: .toolDNS, title: crossesRegion ? "工具 DNS 跨区" : "工具 DNS 待确认",
-                                    message: evidence.summary, recovery: crossesRegion ? .selectNode : .retry,
-                                    evidence: evidence)
+    }
+
+    func probeDNS(exit: ExitLocation,
+                  primary: ((ConnectionStep, DNSEvidence) -> Void) throws -> ProbeResult,
+                  backup check: @escaping (Engine, DNSEvidence, (DNSEvidence) -> Void) throws -> DNSEvidence) throws -> ProbeResult {
+        var backup: BackupDNSCheck?
+        defer { backup?.stopAndWait() }
+
+        func startBackup(_ step: ConnectionStep, _ evidence: DNSEvidence) {
+            guard backup == nil, !stopped else { return }
+            notify(.checking(step, "主检测样本不足，备用 DNS 检测已启动。", evidence))
+            var seed = DNSEvidence(exit: exit.country, exitIP: exit.ip)
+            if step == .pageDNS { seed.tool = evidence.tool }
+            backup = BackupDNSCheck(initial: seed, parentStopped: { self.stopped }, check: check)
+        }
+
+        let result = Result { try primary(startBackup) }
+        switch result {
+        case let .success(main):
+            guard let running = backup else { return main }
+            running.stopAndWait()
+            backup = nil
+            return try Self.verifiedDNSResult(main.evidence.retainingCrossRegion(from: running.observations), exit: exit)
+        case let .failure(incomplete as ConnectionProblem) where incomplete.recovery == .retry &&
+            (incomplete.step == .toolDNS || incomplete.step == .pageDNS) && !stopped:
+            let evidence = incomplete.evidence ?? DNSEvidence(exit: exit.country, exitIP: exit.ip)
+            startBackup(incomplete.step, evidence)
+            guard let running = backup else { throw incomplete }
+            notify(.checking(incomplete.step, "主检测样本不足，正在读取备用检测结果。", evidence))
+            var supplementary: DNSEvidence
+            do {
+                supplementary = try running.waitForResult()
+            } catch let problem as ConnectionProblem {
+                let observations = (problem.evidence ?? running.observations).retainingCrossRegion(from: evidence)
+                throw ConnectionProblem(step: problem.step, title: problem.title, message: problem.message,
+                                        recovery: problem.recovery, evidence: observations)
+            }
+            if supplementary.tool == nil, incomplete.step == .pageDNS { supplementary.tool = evidence.tool }
+            let prior = evidence.retainingCrossRegion(from: running.observations)
+            guard supplementary.tool?.hasKnownCountries == true else {
+                throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 待确认",
+                                        message: "备用来源未取得足够的工具 DNS 样本。请重试。", recovery: .retry,
+                                        evidence: supplementary.retainingCrossRegion(from: prior))
+            }
+            return try Self.verifiedDNSResult(supplementary.retainingCrossRegion(from: prior), exit: exit)
+        case let .failure(error):
+            if let problem = error as? ConnectionProblem, let running = backup {
+                running.stopAndWait()
+                backup = nil
+                throw problem.retainingCrossRegion(from: running.observations)
+            }
+            throw error
+        }
+    }
+
+    private func probeUsingIPLeak(_ relay: URLSession, core: URLSession, corePort: Int, exit: ExitLocation,
+                                  mode: ConnectionMode,
+                                  startBackup: (ConnectionStep, DNSEvidence) -> Void) throws -> ProbeResult {
+        var evidence = DNSEvidence(exit: exit.country, exitIP: exit.ip)
+        notify(.checking(.toolDNS, "正在确认加密 DNS 的解析器地区。", evidence))
+        let tool = try? measureToolDNS(core: core, relay: relay, evidence: evidence, deadline: .now() + 20,
+                                       startBackup: startBackup)
+        evidence.tool = tool?.locations
+        if mode == .strict, evidence.tool?.hasCrossRegion(exit.country) == true {
+            throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 跨区", message: evidence.summary,
+                                    recovery: .selectNode, evidence: evidence)
+        }
+        guard tool?.hasEnoughSamples == true, evidence.tool?.hasKnownCountries == true else {
+            throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 待确认", message: "加密 DNS 的有效样本不足。请重试。",
+                                    recovery: .retry, evidence: evidence)
         }
 
         notify(.checking(.pageDNS, "正在检查网页访问时观测到的 DNS。", evidence))
-        do {
-            evidence.page = try measurePageDNS(relay, evidence: evidence, deadline: .now() + 32)
-        } catch {
-            throw ConnectionProblem(step: .pageDNS, title: "网页 DNS 待确认",
-                                    message: "网页 DNS 的有效样本不足。请重试。",
-                                    recovery: .retry, evidence: evidence)
-        }
-        guard let page = evidence.page,
-              (try? Self.validateCountries(exit: exit.country, expected: expected, dns: page.countries)) != nil else {
+        let page = try? measurePageDNS(relay, evidence: evidence, deadline: .now() + 32,
+                                       startBackup: startBackup)
+        evidence.page = page?.locations
+        let pageCrosses = evidence.page?.hasCrossRegion(exit.country) == true
+        if pageCrosses {
             notify(.checking(.pageDNS, "网页 DNS 地区未通过，正在复核代理下游。", evidence))
             evidence.downstream = try? reviewDownstream(corePort: corePort, core: core, relay: relay,
                                                        deadline: .now() + 10)
-            let downstreamMismatch = evidence.downstream?.hasCrossRegion(exit.country) == true
-            let pageMismatch = evidence.page?.hasCrossRegion(exit.country) == true
-            let title = downstreamMismatch ? "代理下游 DNS 跨区" : (pageMismatch ? "网页 DNS 跨区" : "网页 DNS 待确认")
-            throw ConnectionProblem(step: .pageDNS, title: title,
-                                    message: evidence.summary,
-                                    recovery: downstreamMismatch || pageMismatch ? .selectNode : .retry, evidence: evidence)
+            if mode == .strict {
+                let title = evidence.downstream?.hasCrossRegion(exit.country) == true ? "代理下游 DNS 跨区" : "网页 DNS 跨区"
+                throw ConnectionProblem(step: .pageDNS, title: title, message: evidence.summary,
+                                        recovery: .selectNode, evidence: evidence)
+            }
         }
-        if !toolMatches {
+        guard page?.hasEnoughSamples == true, evidence.page?.hasKnownCountries == true,
+              evidence.downstream?.hasKnownCountries ?? true else {
+            throw ConnectionProblem(step: .pageDNS, title: "网页 DNS 待确认", message: "网页 DNS 的有效样本不足。请重试。",
+                                    recovery: .retry, evidence: evidence)
+        }
+        return try Self.verifiedDNSResult(evidence, exit: exit)
+    }
+
+    private func probeUsingDNSCheck(_ configuration: URLSessionConfiguration, core: URLSession, corePort: Int,
+                                    exit: ExitLocation, mode: ConnectionMode, initial: DNSEvidence,
+                                    observed: (DNSEvidence) -> Void) throws -> DNSEvidence {
+        var evidence = initial
+        var completedTool = evidence.tool
+        let challenge = DNSCheckObserver.Challenge()
+        let observer = DNSCheckObserver(challenge: challenge)
+        let session = URLSession(configuration: configuration, delegate: observer, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        var step = ConnectionStep.toolDNS
+        do {
+            if evidence.tool?.hasKnownCountries != true {
+                notify(.checking(.toolDNS, "主检测未取得有效结果，正在用备用来源核对工具 DNS。", evidence))
+                let requests = (0..<6).map { _ in
+                    let seed = String(UUID().uuidString.prefix(8)).lowercased()
+                    return ResolvedProxy.dnsQuery("\(seed).test.dnscheck.tools", type: "TXT")
+                }
+                let responses = try fetchResponses(core, requests, deadline: .now() + 12, keepCompletedOnStop: true)
+                let samples = responses.compactMap { try? $0.get() }.compactMap(DNSLocations.resolverAddress)
+                if !samples.isEmpty {
+                    evidence.tool = try? locateUsingDNSCheck(Set(samples), session: session)
+                    observed(evidence)
+                    if samples.count >= 3, evidence.tool?.hasKnownCountries == true { completedTool = evidence.tool }
+                }
+            }
+            if mode == .strict, evidence.tool?.hasCrossRegion(exit.country) == true {
+                throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 跨区", message: evidence.summary,
+                                        recovery: .selectNode, evidence: evidence)
+            }
+
+            // The primary path can supply tool DNS while this check collects independent page evidence.
+            step = .pageDNS
+            notify(.checking(.pageDNS, "正在用备用来源核对网页 DNS 和固定 IP 对照。", evidence))
+            let socket = session.webSocketTask(with: challenge.socketURL)
+            socket.maximumMessageSize = 4096
+            socket.resume()
+            defer { socket.cancel(with: .goingAway, reason: nil) }
+            try observer.waitForOpen(until: .now() + 10, stopped: { self.stopped })
+            observer.receive(socket)
+            try observer.checkpoint(socket, until: .now() + 4, stopped: { self.stopped })
+
+            let seed = ResolvedProxy.dnsQuery(challenge.addressLookupName, type: "A")
+            let address = try ResolvedProxy.answer(fetchData(core, seed, deadline: .now() + 8))
+            let control = ResolvedProxy(upstreamPort: corePort, probeTargets: [challenge.controlName: address])
+            defer { control.stop() }
+            let controlPort = try control.start()
+            let fixed = URLSession(configuration: sessionConfiguration(port: controlPort),
+                                   delegate: observer, delegateQueue: nil)
+            defer { fixed.invalidateAndCancel() }
+
+            let controlRequest = URLRequest(url: URL(string: "https://\(challenge.controlName)/")!)
+            let pageRequests = challenge.pageNames.map { (session, URLRequest(url: URL(string: "https://\($0)/")!)) }
+            let replies = try fetchResponses([(fixed, controlRequest)] + pageRequests, deadline: .now() + 12,
+                                             keepCompletedOnStop: true)
+            let completed = Set(zip([challenge.controlName] + challenge.pageNames, replies).compactMap { name, reply in
+                (try? reply.get()) != nil ? name : nil
+            })
+            if !stopped {
+                // A real DNS event traverses the observation queue. WebSocket pongs only show connectivity.
+                let deadline = DispatchTime.now() + 4
+                let markers = challenge.markerNames.map { ResolvedProxy.dnsQuery($0, type: "A") }
+                _ = try? fetchResponses(core, markers, deadline: deadline)
+                observer.waitForMarker(until: deadline, stopped: { self.stopped })
+            }
+            let snapshot = observer.snapshot()
+            let seen = challenge.observations(snapshot.records, healthy: snapshot.healthy, completedHTTPS: completed)
+            let addresses = seen.page.union(seen.control)
+            if !addresses.isEmpty {
+                let locations = try locateUsingDNSCheck(addresses, session: session)
+                if !seen.page.isEmpty {
+                    evidence.page = DNSLocations(records: locations.records.filter { seen.page.contains($0["ip"] ?? "") })
+                }
+                if !seen.control.isEmpty {
+                    evidence.downstream = DNSLocations(records: locations.records.filter { seen.control.contains($0["ip"] ?? "") })
+                }
+                observed(evidence)
+            }
+            guard seen.isComplete, !stopped else {
+                throw AppFailure("备用来源未取得三组有效网页 DNS 样本和固定 IP 对照。")
+            }
+            guard evidence.page?.hasKnownCountries == true, evidence.downstream?.hasKnownCountries ?? true else {
+                throw AppFailure("部分网页或下游 DNS 地址尚未定位。")
+            }
+            evidence.tool = completedTool
+            return evidence
+        } catch let problem as ConnectionProblem {
+            throw problem
+        } catch {
+            let title = step == .toolDNS ? "工具 DNS 待确认" : "网页 DNS 待确认"
+            let message = (error as? AppFailure)?.message ?? "暂时无法完成备用 DNS 检查。"
+            throw ConnectionProblem(step: step, title: title, message: message, recovery: .retry, evidence: evidence)
+        }
+    }
+
+    private static func verifiedDNSResult(_ evidence: DNSEvidence, exit: ExitLocation) throws -> ProbeResult {
+        guard evidence.tool?.hasKnownCountries == true, let page = evidence.page, page.hasKnownCountries,
+              evidence.downstream?.hasKnownCountries ?? true else {
+            throw ConnectionProblem(step: .pageDNS, title: "DNS 待确认", message: "这次检查未取得足够的 DNS 结果。",
+                                    recovery: .retry, evidence: evidence)
+        }
+        if page.hasCrossRegion(exit.country) || evidence.downstream?.hasCrossRegion(exit.country) == true {
+            throw ConnectionProblem(step: .pageDNS, title: "网页 DNS 跨区", message: evidence.summary,
+                                    recovery: .selectNode, evidence: evidence)
+        }
+        if evidence.tool?.hasCrossRegion(exit.country) == true {
             throw ConnectionProblem(step: .toolDNS, title: "工具 DNS 跨区", message: evidence.summary,
                                     recovery: .selectNode, evidence: evidence)
         }
         return ProbeResult(exitIP: exit.ip, country: exit.country, dns: page.records, evidence: evidence)
+    }
+
+    private func locateUsingDNSCheck(_ addresses: Set<String>, session: URLSession) throws -> DNSLocations {
+        guard (1...48).contains(addresses.count), addresses.allSatisfy(DNSLocations.isAddress) else {
+            throw AppFailure("备用服务的 DNS 地址样本无效。")
+        }
+        let ordered = addresses.sorted()
+        let requests = ordered.map { URLRequest(url: URL(string: "https://ip.addr.tools/" + $0)!) }
+        let replies = try fetchResponses(session, requests, deadline: .now() + 12, keepCompletedOnStop: true)
+        let records = zip(ordered, replies).map { ip, result in
+            let data = try? result.get()
+            let info = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let region = info?["country"] as? String ?? ""
+            let known = info?["ip"] as? String == ip && region.count == 2 &&
+                        Locale.Region.isoRegions.contains(Locale.Region(region))
+            return ["ip": ip, "country": known ? region : ""]
+        }
+        return DNSLocations(records: records)
     }
 
     private func confirmAndRecheck(_ problem: ConnectionProblem, relay: URLSession,
@@ -725,5 +997,46 @@ final class Engine: @unchecked Sendable {
         } catch {
             if !stopped { failure = Self.preparationProblem(error) }
         }
+    }
+}
+
+private final class BackupDNSCheck: @unchecked Sendable {
+    private let worker: Engine
+    private let finished = DispatchGroup()
+    private let lock = NSLock()
+    private var observed: DNSEvidence
+    private var result: Result<DNSEvidence, Error>?
+
+    init(initial: DNSEvidence, parentStopped: @escaping () -> Bool,
+         check: @escaping (Engine, DNSEvidence, (DNSEvidence) -> Void) throws -> DNSEvidence) {
+        worker = Engine(parentStopped: parentStopped)
+        observed = initial
+        finished.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { self.finished.leave() }
+            let result = Result {
+                try check(self.worker, initial) { evidence in
+                    self.lock.withLock { self.observed = evidence }
+                }
+            }
+            self.lock.withLock {
+                if case let .success(evidence) = result {
+                    self.observed = evidence.retainingCrossRegion(from: self.observed)
+                }
+                self.result = result
+            }
+        }
+    }
+
+    var observations: DNSEvidence { lock.withLock { observed } }
+
+    func waitForResult() throws -> DNSEvidence {
+        finished.wait()
+        return try lock.withLock { try result!.get() }
+    }
+
+    func stopAndWait() {
+        worker.stop()
+        finished.wait()
     }
 }

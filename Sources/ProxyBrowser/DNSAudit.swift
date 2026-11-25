@@ -55,4 +55,24 @@ struct DNSEvidence {
     }
 
     var checkedPage: DNSLocations? { downstream?.hasCrossRegion(exit) == true ? downstream : page }
+
+    func retainingCrossRegion(from other: DNSEvidence?) -> DNSEvidence {
+        guard let other, other.exit == exit, other.exitIP == exitIP else { return self }
+
+        func retain(_ locations: DNSLocations?, _ alternate: DNSLocations?) -> DNSLocations? {
+            var records = locations?.records ?? []
+            for record in alternate?.records ?? [] {
+                guard let country = record["country"], !country.isEmpty, country != exit,
+                      !records.contains(record) else { continue }
+                records.append(record)
+            }
+            return records.isEmpty ? locations : DNSLocations(records: records)
+        }
+
+        var evidence = self
+        evidence.tool = retain(tool, other.tool)
+        evidence.page = retain(page, other.page)
+        evidence.downstream = retain(downstream, other.downstream)
+        return evidence
+    }
 }

@@ -24,7 +24,8 @@ final class CheckPresentationTests: XCTestCase {
         let problem = ConnectionProblem(step: .pageDNS, title: "网页 DNS 待确认",
                                         message: "样本不足", recovery: .retry, evidence: evidence)
         let copy = CheckPresentation(problem: problem, region: "US")
-        XCTAssertEqual(copy.title, "暂时无法确认")
+        XCTAssertEqual(copy.title, "网页 DNS 待确认")
+        XCTAssertEqual(copy.message, "样本不足")
         XCTAssertEqual(copy.rowLabel, "待确认")
         XCTAssertTrue(CheckPresentation.details(problem: problem).contains("样本不足"))
     }

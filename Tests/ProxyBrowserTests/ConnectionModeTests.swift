@@ -23,7 +23,9 @@ final class ConnectionModeTests: XCTestCase {
         let crossRegion = DNSLocations(records: [["country": "HK"]])
         let evidence = [
             DNSEvidence(exit: "US", exitIP: "203.0.113.1", tool: crossRegion, page: missingCountry),
-            DNSEvidence(exit: "US", tool: crossRegion, page: crossRegion)
+            DNSEvidence(exit: "US", exitIP: "203.0.113.1", tool: crossRegion, page: crossRegion, downstream: missingCountry),
+            DNSEvidence(exit: "US", tool: crossRegion, page: crossRegion),
+            DNSEvidence(exit: "US", exitIP: "203.0.113.1", tool: crossRegion, page: crossRegion)
         ]
         for report in evidence {
             let problem = ConnectionProblem(step: .pageDNS, title: "", message: "", recovery: .retry, evidence: report)

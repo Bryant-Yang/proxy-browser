@@ -49,24 +49,28 @@ enum NodeRegions {
 
     static func infer(_ label: String) -> String? {
         var candidates = Set<String>()
-        for character in label {
-            let scalars = character.unicodeScalars.map(\.value)
-            if scalars.count == 2, scalars.allSatisfy({ (0x1F1E6...0x1F1FF).contains($0) }) {
-                let code = String(String.UnicodeScalarView(scalars.compactMap { UnicodeScalar($0 - 0x1F1E6 + 65) }))
-                if codes.contains(code) { candidates.insert(code) }
-            }
-        }
         let text = normalized(label)
         for match in namesPattern.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
             if let range = Range(match.range, in: text), let code = aliases[String(text[range])] {
                 candidates.insert(code)
             }
         }
-        if let prefix = label.range(of: #"^[A-Z]{2}(?=[\s_\-丨|]|$)"#, options: .regularExpression) {
-            let code = String(label[prefix])
+        let labelBody = label.drop(while: { $0.isWhitespace || "_-丨|".contains($0) || flagCode($0) != nil })
+        if let prefix = labelBody.range(of: #"^[A-Z]{2}(?=[\s_\-丨|]|$)"#, options: .regularExpression) {
+            let code = String(labelBody[prefix])
             if codes.contains(code) { candidates.insert(code) }
         }
+        // Subscription flags can be decorative. Only use them when the label has no textual region.
+        if !candidates.isEmpty { return candidates.count == 1 ? candidates.first : nil }
+
+        candidates = Set(label.compactMap(flagCode).filter { codes.contains($0) })
         return candidates.count == 1 ? candidates.first : nil
+    }
+
+    private static func flagCode(_ character: Character) -> String? {
+        let scalars = character.unicodeScalars.map(\.value)
+        guard scalars.count == 2, scalars.allSatisfy({ (0x1F1E6...0x1F1FF).contains($0) }) else { return nil }
+        return String(String.UnicodeScalarView(scalars.compactMap { UnicodeScalar($0 - 0x1F1E6 + 65) }))
     }
 }
 

@@ -641,6 +641,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             evidence = problem.evidence
             confirmedExit = problem.confirmedExit
             showChecks(problem.step, evidence: problem.evidence, state: .failed)
+            if problem.recovery == .retry, problem.step == .toolDNS || problem.step == .pageDNS {
+                checks[2].show(.failed, value: explanation.rowLabel)
+            }
             if let exit = problem.confirmedExit {
                 checks[1].show(.failed, value: NodeRegions.name(exit.country))
             }

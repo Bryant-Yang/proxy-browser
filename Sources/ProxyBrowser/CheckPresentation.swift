@@ -6,6 +6,12 @@ struct CheckPresentation {
     let rowLabel: String
 
     init(problem: ConnectionProblem, region: String) {
+        if problem.recovery == .retry && (problem.step == .toolDNS || problem.step == .pageDNS) {
+            title = problem.title
+            message = problem.message
+            rowLabel = "待确认"
+            return
+        }
         if let evidence = problem.evidence {
             let locations = problem.step == .toolDNS ? evidence.tool : evidence.checkedPage
             let places = Self.foreignRegions(locations, comparedWith: evidence.exit)
